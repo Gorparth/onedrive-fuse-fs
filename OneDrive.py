@@ -2,72 +2,104 @@
 
 from __future__ import with_statement
 from calendar import timegm
+from time import time, sleep
 
 import __builtin__
-import os
-from os.path import basename, dirname
+from os.path import basename, dirname, join
 import stat
 import errno
 import logging
-import yaml
 import onedrivesdk
+from multiprocessing import Process
+import sys
+
+from utils.conf import get_conf
+from cache import db
 
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 
 FileNotFound = getattr(__builtin__, "IOError", "FileNotFoundError")
 
+
 class OneDriveFS(LoggingMixIn, Operations):
-    def __init__(self, api, root, log=None, block_size=512):
-        self.api, self.root, self.block_size = api, root, block_size
-        self.log = log or logging.getLogger('{}.{}'.format(__name__, self.__class__.__name__))
+    def __init__(self, api, root, cache, log=None, block_size=512):
+        self.api, self.root, self.block_size, self.handles, self.cache = api, root, block_size, {}, cache
+
+        self.log = log or logging.getLogger(
+            '{}.{}'.format(__name__, self.__class__.__name__))
 
     # Helpers
     # =======
 
+    def _get_item_path_name(self, path):
+        folder = dirname(path)
+        name = basename(path)
+
+        if name == '':
+            name = 'root'
+        return [folder, name]
+
     def _isdir(self, path):
         self.log.debug('Checking if is dir for %s', path)
-        return self.api.item(path=path).get().folder is not None
+        item_path = self._get_item_path_name(path)
+        return self.cache.isFolder(item_path[0], item_path[1])
 
     def _listdir(self, path):
         self.log.debug('Getting directory list for %s', path)
-        return self.api.item(path=path).children.get()
+        return self.cache.get_children(path)
 
     def _getitem(self, path):
         self.log.debug('Getting item for %s', path)
-        return self.api.item(path=path).get()
-
+        item_path = self._get_item_path_name(path)
+        return self.cache.get_item(item_path[0], item_path[1])
 
     # Filesystem methods
     # ==================
 
-    chmod = None
-    chown = None
-    readlink = None
-    mknod = None
-    symlink = None
-    access = None
+    def chmod(self, path, mode):
+        """Not implemented."""
+        pass
 
-    # def access(self, path, amode):
-    #     self.log.debug('Checking access for %s', path)
-    #     try:
-    #         return self._getitem(path)
-    #         self.log.debug('Access to %s is granted', path)
-    #     except onedrivesdk.error.OneDriveError:
-    #         self.log.debug('Access to %s has error', path)
-    #         return FuseOSError(errno.EACCES)
+
+    def chown(self, path, uid, gid):
+        """Not implemented."""
+        pass
 
     def getattr(self, path, fh=None):
-        obj = self._getitem(path)
-        obj_mtime = obj.last_modified_date_time or obj.created_date_time
-        st_mtime = timegm(obj_mtime.utctimetuple())
-        return dict(
-            st_mode=((stat.S_IFREG | 0644) if obj.file else (stat.S_IFDIR | 0755)),
-            st_mtime=st_mtime,
-            st_size=obj.size)
+        if fh:
+            node = self.handles[fh]
+        else:
+            node = self._getitem(path)
+            if not node:
+                raise FuseOSError(errno.ENOENT)
+
+        obj_mtime = node.modified or node.created
+        times = dict(st_atime=time(),
+                     st_mtime=timegm(obj_mtime.utctimetuple()),
+                     st_ctime=timegm(node.created.utctimetuple()))
+
+        if node.isFolder:
+            return dict(st_mode=stat.S_IFDIR | 0o0777,
+                        st_nlink=1,
+                        **times)
+        else:
+            return dict(st_mode=stat.S_IFREG | 0o0666,
+                        st_nlink=1,
+                        st_size=node.size,
+                        st_blocksize=self.block_size,
+                        st_blocks=node.size//self.block_size,
+                        **times)
 
     def readdir(self, path, fh):
-        return ['.', '..'] + [x.name for x in self._listdir(path).get()]
-        # map(lambda x: x.name, self.api.item(path=path).children.get())
+        self.log.debug('Reading dir %s', path)
+        node = self._getitem(path)
+
+        if not node:
+            raise FuseOSError(errno.ENOENT)
+        if not node.isFolder:
+            raise FuseOSError(errno.ENOTDIR)
+
+        return ['.', '..'] + [x.name for x in self._listdir(path)]
 
     def rmdir(self, path):
         if not self._isdir(path):
@@ -107,12 +139,6 @@ class OneDriveFS(LoggingMixIn, Operations):
         renamed_item.name = basename(new)
         renamed_item.id = old_id
         self.api.item(id=renamed_item.id).update(renamed_item)
-
-    # def link(self, target, name):
-        # return os.link(self._full_path(target), self._full_path(name))
-
-    # def utimens(self, path, times=None):
-        # return os.utime(self._full_path(path), times)
 
     # File methods
     # ============
@@ -171,6 +197,25 @@ def authorize_onedrive(client, redirect_uri):
     code = raw_input('Paste code here: ')
     return code
 
+def sync_onedrive_items(cache, api, log, sync_time=None):
+    while True:
+        token = cache.config.get('onedrive_delta_token')
+        log.debug('Onedrive delta token is %s', token)
+        items = api.item(path='/').delta(token).get()
+        log.debug('new items to sync %i', len(items))
+        while len(items) > 0:
+            cache.insert_items(items)
+            token = items.token
+            items = api.item(path='/').delta(token).get()
+        cache.commit_items()
+        cache.config.update(dict(onedrive_delta_token=token))
+        log.debug('Onedrive items synced')
+        if sync_time:
+            sleep(sync_time)
+        else:
+            return
+
+
 def args():
     import argparse
     parser = argparse.ArgumentParser(description='Mount OneDrive as a FUSE filesystem.')
@@ -190,11 +235,34 @@ def args():
 
     return optz
 
+def set_encoding(force_utf=False, logger=None):
+    """Sets the default encoding to UTF-8 if none is set.
+    :param force_utf: force UTF-8 output"""
+
+    enc = str.lower(sys.stdout.encoding)
+    print enc
+    utf_flag = False
+
+    if not enc or force_utf:
+        import io
+
+        sys.stdout = io.TextIOWrapper(sys.stdout.detach(), encoding='utf-8')
+        sys.stderr = io.TextIOWrapper(sys.stderr.detach(), encoding='utf-8')
+        utf_flag = True
+    else:
+        def unicode_hook(type_, value, traceback):
+            sys.__excepthook__(type_, value, traceback)
+            if type_ == UnicodeEncodeError:
+                logger.error('Please set your locale or use the "--utf" flag.')
+
+        sys.excepthook = unicode_hook
+
+    return utf_flag
+
 def main():
     optz = args()
 
-    with open(optz.config, 'r') as configfile:
-        cfg = yaml.load(configfile)
+    cfg = get_conf(optz.config)
 
     log = logging.getLogger()
     logging.basicConfig(level=logging.WARNING
@@ -202,11 +270,25 @@ def main():
 
     opts_fuse = dict(foreground=optz.foreground or optz.debug)
     log.debug('FUSE: {%s}', opts_fuse)
-    log.debug('Onedrive client id: %s, redirect uri: %s', cfg['client_id'], cfg['redirect_uri'])
+    log.debug('Onedrive client id: %s, redirect uri: %s', cfg['onedrive']['client_id'], cfg['onedrive']['redirect_uri'])
 
-    api = login_onedrive(cfg['client_id'], cfg['client_secret'], cfg['redirect_uri'])
+    api = login_onedrive(
+        cfg['onedrive']['client_id'],
+        cfg['onedrive']['client_secret'],
+        cfg['onedrive']['redirect_uri'])
 
-    FUSE(OneDriveFS(api, root='/', log=log, block_size=cfg['block_size']), optz.mountpoint, foreground=True)
+    path = join(dirname(__file__))
+    items_cache = db.ItemsCache(cache_path=path, settings_path=optz.config, log=log)
+
+    log.debug('First sync')
+    sync_onedrive_items(items_cache, api, log)
+    log.debug('End first sync')
+
+    sync_process = Process(target=sync_onedrive_items, args=(items_cache, api, log, int(cfg['onedrive']['sync_time'])))
+    sync_process.start()
+
+    FUSE(OneDriveFS(api, root='/', log=log, cache=items_cache,
+        block_size=int(cfg['fuse']['block_size'])), optz.mountpoint, foreground=True)
 
 if __name__ == '__main__':
     main()
