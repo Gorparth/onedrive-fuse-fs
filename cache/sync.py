@@ -12,18 +12,17 @@ class SyncMixin(object):
 
     def insert_items(self, items):
         for item in items:
-            path = item.parent_reference.path.replace('/drive/root:','') if item.parent_reference else None
-            if path == '' or path == None:
+            path = item.parent_reference.path if item.parent_reference else None
+            if path == None:
+                path = '/'
+            path = path.replace('/drive/root:','')
+            if path == '':
                 path = '/'
             common = dict(created_date_time=item.created_date_time,
                           id=item.id, name=item.name,
                           last_modified_date_time=item.last_modified_date_time,
-                          path=path, deleted=False)
-            if item.deleted:
-                self.log.debug('item deleted %s', item.name)
-                index = next(index for (index, d) in enumerate(self.items) if d['id'] == item.id)
-                self.item[index]['deleted'] = True
-            elif item.file:
+                          path=path, deleted=item.deleted is not None)
+            if item.file:
                 new_file = dict(size=item.size, isFolder=False, **common)
                 self.items.append(new_file)
             else:
@@ -50,4 +49,4 @@ class SyncMixin(object):
             deleted = [x for x in self.items if x['deleted']]
 
             for d in deleted:
-                conn.execute('DELETE FROM items WHERE id=?', d['id'])
+                conn.execute('DELETE FROM items WHERE id=?', [d['id']])

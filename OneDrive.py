@@ -106,14 +106,18 @@ class OneDriveFS(LoggingMixIn, Operations):
             raise FuseOSError(errno.ENOTDIR)
         elif self._listdir(path):
             raise FuseOSError(errno.ENOTEMPTY)
+        item = self._getitem(path)
         self.api.item(path=path).delete()
+        self.cache.delete_item(item.id)
+
 
     def mkdir(self, path, mode):
         name, parent = basename(path), dirname(path)
         item = onedrivesdk.Item()
         item.name = name
         item.folder = onedrivesdk.Folder()
-        self.api.item(path=parent).children.add(item)
+        new_item = self.api.item(path=parent).children.add(item)
+        self.cache.add_item(new_item.id, name, parent, new_item.created_date_time)
 
 
     def statfs(self, path):
@@ -129,6 +133,8 @@ class OneDriveFS(LoggingMixIn, Operations):
     def unlink(self, path):
         if self._isdir(path):
             raise FuseOSError(errno.EISDIR)
+        item = self._getitem(path)
+        self.cache.delete_item(item.id)
         self.api.item(path=path).delete()
 
     def rename(self, old, new):
@@ -138,6 +144,7 @@ class OneDriveFS(LoggingMixIn, Operations):
         renamed_item = onedrivesdk.Item()
         renamed_item.name = basename(new)
         renamed_item.id = old_id
+        self.cache.update_name(old_id, renamed_item.name)
         self.api.item(id=renamed_item.id).update(renamed_item)
 
     # File methods

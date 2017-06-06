@@ -1,10 +1,16 @@
 import logging
-from .cursors import cursor
+from .cursors import cursor, mod_cursor
 from datetime import datetime
 
 GET_ITEM_BY_NAME = """SELECT * FROM items WHERE path LIKE ? AND name LIKE ?"""
 
 GET_CHILDREN_BY_PATH = """SELECT * FROM items WHERE path LIKE ?"""
+
+DELETE_ITEM_BY_ID = """DELETE FROM items WHERE id=?"""
+
+ADD_ITEM = """INSERT INTO items (id, isFolder, name, created, modified, path) VALUES (?, 1, ?, ?, ?, ?)"""
+
+RENAME_ITEM = """UPDATE items SET name=? WHERE id=?"""
 
 def datetime_from_string(dt):
     try:
@@ -47,3 +53,19 @@ class QueryMixin(object):
             c.execute(GET_ITEM_BY_NAME, [path, name])
             r = c.fetchone()
         return Item(r) if r else None
+
+    def delete_item(self, id):
+        self.log.debug('Deleting item with id %s', id)
+        with mod_cursor(self._conn) as c:
+            c.execute(DELETE_ITEM_BY_ID, [id])
+
+    def add_item(self, id, name, path, date):
+        self.log.debug('Adding item %s', name)
+        with mod_cursor(self._conn) as c:
+            c.execute(ADD_ITEM, [id, name, date, date, path])
+
+    def update_name(self, id, name):
+        self.log.debug('Renaming item %s', id)
+        with mod_cursor(self._conn) as c:
+            c.execute(RENAME_ITEM, [name, id])
+
