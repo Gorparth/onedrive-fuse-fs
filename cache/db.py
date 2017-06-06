@@ -55,7 +55,6 @@ class ItemsCache(SchemaMixin, SyncMixin, QueryMixin):
 
         self.db_path = os.path.join(cache_path, self._conf['sqlite']['filename'])
         self.log.debug('The db path is %s', self.db_path)
-        print self.db_path
         self.thread_local = local()
 
         self.integrity_check(check)

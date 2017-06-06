@@ -4,30 +4,306 @@ from __future__ import with_statement
 from calendar import timegm
 from time import time, sleep
 
-import __builtin__
 from os.path import basename, dirname, join
 import stat
 import errno
 import logging
 import onedrivesdk
 from multiprocessing import Process
+from threading import Lock
+from collections import defaultdict, deque
 import sys
+import os
+import http.client as http
+import requests
+
 
 from utils.conf import get_conf
 from cache import db
 
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 
-FileNotFound = getattr(__builtin__, "IOError", "FileNotFoundError")
+logger = logging.getLogger(__name__)
+
+def response_chunk(api, path, offset, length):
+    ok_codes = [http.PARTIAL_CONTENT]
+    end = offset + length - 1
+    logger.debug('chunk o %d l %d' % (offset, length))
+
+    url = api.base_url + 'drive/root%3A' + path + '%3A/content'
+    headers={'Range': 'bytes=%d-%d' % (offset, end), 'Authorization': 'Bearer %s' % api.auth_provider.access_token}
+    r = requests.get(url, stream=True, headers=headers)
+
+    if r.status_code not in ok_codes:
+        raise requests.RequestException(r.status, r.text)
+
+    return r
+
+class ReadProxy(object):
+    """Dict of stream chunks for consecutive read access of files."""
+
+    def __init__(self, api, open_chunk_limit, timeout, dl_chunk_size):
+        self.api = api
+        self.lock = Lock()
+        self.files = defaultdict(lambda: ReadProxy.ReadFile(open_chunk_limit, timeout, dl_chunk_size))
+
+    class StreamChunk(object):
+        """StreamChunk represents a file node chunk as a streamed ranged HTTP response
+        which may or may not be partially read."""
+
+        __slots__ = ('offset', 'r', 'end')
+
+        def __init__(self, api, path, offset, length, **kwargs):
+            self.offset = offset
+            """the first byte position (fpos) available in the chunk"""
+
+            self.r = response_chunk(api, path, offset, length)
+            """:type: requests.Response"""
+
+            self.end = offset + int(self.r.headers['content-length']) - 1
+            """the last byte position (fpos) contained in the chunk"""
+
+        def has_byte_range(self, offset, length):
+            """Tests whether chunk begins at **offset** and has at least **length** bytes remaining."""
+            logger.debug('s: %d-%d; r: %d-%d'
+                         % (self.offset, self.end, offset, offset + length - 1))
+            if offset == self.offset and offset + length - 1 <= self.end:
+                return True
+            return False
+
+        def get(self, length):
+            """Gets *length* bytes beginning at current offset.
+            :param length: the number of bytes to get
+            :raises: Exception if less than *length* bytes were received \
+             but end of chunk was not reached"""
+
+            b = next(self.r.iter_content(length))
+            self.offset += len(b)
+
+            if len(b) < length and self.offset <= self.end:
+                logger.warning('Chunk ended unexpectedly.')
+                raise Exception
+            return b
+
+        def close(self):
+            """Closes connection on the stream."""
+            self.r.close()
+
+    class ReadFile(object):
+        """Represents a file opened for reading.
+        Encapsulates at most :attr:`MAX_CHUNKS_PER_FILE` open chunks."""
+
+        __slots__ = ('chunks', 'access', 'lock', 'timeout', 'dl_chunk_size')
+
+        def __init__(self, open_chunk_limit, timeout, dl_chunk_size):
+            self.dl_chunk_size = dl_chunk_size
+            self.chunks = deque(maxlen=open_chunk_limit)
+            self.access = time()
+            self.lock = Lock()
+            self.timeout = timeout
+
+        def get(self, api, path, offset, length, total):
+            """Gets a byte range from existing StreamChunks"""
+
+            with self.lock:
+                i = len(self.chunks) - 1
+                while i >= 0:
+                    c = self.chunks[i]
+                    if c.has_byte_range(offset, length):
+                        try:
+                            bytes_ = c.get(length)
+                        except:
+                            self.chunks.remove(c)
+                        else:
+                            return bytes_
+                    i -= 1
+
+            try:
+                with self.lock:
+                    chunk = ReadProxy.StreamChunk(api, path, offset, self.dl_chunk_size, timeout=self.timeout)
+                    if len(self.chunks) == self.chunks.maxlen:
+                        self.chunks[0].close()
+
+                    self.chunks.append(chunk)
+                    return chunk.get(length)
+            except Exception as e:
+                logger.error(e)
+
+        def clear(self):
+            """Closes chunks and clears chunk deque."""
+            with self.lock:
+                for chunk in self.chunks:
+                    try:
+                        chunk.close()
+                    except:
+                        pass
+                self.chunks.clear()
+
+    def get(self, path, offset, length, total):
+        with self.lock:
+            f = self.files[path]
+        return f.get(self.api, path, offset, length, total)
+
+    def invalidate(self):
+        pass
+
+    def release(self, path):
+        with self.lock:
+            f = self.files.get(path)
+        if f:
+            f.clear()
+
+class WriteProxy(object):
+    """Collection of WriteStreams for consecutive file write operations."""
+
+    def __init__(self, acd_client, cache, buffer_size, timeout):
+        self.acd_client = acd_client
+        self.cache = cache
+        self.files = defaultdict(lambda: WriteProxy.WriteStream(buffer_size, timeout))
+
+    class WriteStream(object):
+        """A WriteStream is a binary file-like object that is backed by a Queue.
+        It will remember its current offset."""
+
+        __slots__ = ('q', 'offset', 'error', 'closed', 'done', 'timeout')
+
+        def __init__(self, buffer_size, timeout):
+            self.q = Queue(maxsize=buffer_size)
+            """a queue that buffers written blocks"""
+            self.offset = 0
+            """the beginning fpos"""
+            self.error = False
+            """whether the read or write failed"""
+            self.closed = False
+            self.done = Event()
+            """done event is triggered when file is successfully read and transferred"""
+            self.timeout = timeout
+
+        def write(self, data: bytes):
+            """Writes data into queue.
+            :raises: FuseOSError on timeout"""
+
+            if self.error:
+                raise FuseOSError(errno.EREMOTEIO)
+            try:
+                self.q.put(data, timeout=self.timeout)
+            except QueueFull:
+                logger.error('Write timeout.')
+                raise FuseOSError(errno.ETIMEDOUT)
+            self.offset += len(data)
+
+        def read(self, ln=0) -> bytes:
+            """Returns as much byte data from queue as possible.
+            Returns empty bytestring (EOF) if queue is empty and file was closed.
+            :raises: IOError"""
+
+            if self.error:
+                raise IOError(errno.EIO, errno.errorcode[errno.EIO])
+
+            if self.closed and self.q.empty():
+                return b''
+
+            b = [self.q.get()]
+            self.q.task_done()
+            while not self.q.empty():
+                b.append(self.q.get())
+                self.q.task_done()
+
+            return b''.join(b)
+
+        def flush(self):
+            """Waits until the queue is emptied.
+            :raises: FuseOSError"""
+
+            while True:
+                if self.error:
+                    raise FuseOSError(errno.EREMOTEIO)
+                if self.q.empty():
+                    return
+                sleep(1)
+
+        def close(self):
+            """Sets the closed flag to signal 'EOF' to the read function.
+            Then, waits until :attr:`done` event is triggered.
+            :raises: FuseOSError"""
+
+            self.closed = True
+            # prevent read deadlock
+            self.q.put(b'')
+
+            # wait until read is complete
+            while True:
+                if self.error:
+                    raise FuseOSError(errno.EREMOTEIO)
+                if self.done.wait(1):
+                    return
+
+    def write_n_sync(self, stream: WriteStream, node_id: str):
+        """Try to overwrite file with id ``node_id`` with content from ``stream``.
+        Triggers the :attr:`WriteStream.done` event on success.
+        :param stream: a file-like object"""
+
+        try:
+            r = self.acd_client.overwrite_stream(stream, node_id)
+        except (RequestError, IOError) as e:
+            stream.error = True
+            logger.error('Error writing node "%s". %s' % (node_id, str(e)))
+        else:
+            self.cache.insert_node(r)
+            stream.done.set()
+
+    def write(self, node_id, fh, offset, bytes_):
+        """Gets WriteStream from defaultdict. Creates overwrite thread if offset is 0,
+        tries to continue otherwise.
+        :raises: FuseOSError: wrong offset or writing failed"""
+
+        f = self.files[fh]
+
+        if f.offset == offset:
+            f.write(bytes_)
+        else:
+            f.error = True  # necessary?
+            logger.error('Wrong offset for writing to fh %s.' % fh)
+            raise FuseOSError(errno.ESPIPE)
+
+        if offset == 0:
+            t = Thread(target=self.write_n_sync, args=(f, node_id))
+            t.daemon = True
+            t.start()
+
+    def flush(self, fh):
+        f = self.files.get(fh)
+        if f:
+            f.flush()
+
+    def release(self, fh):
+        """:raises: FuseOSError"""
+        f = self.files.get(fh)
+        if f:
+            try:
+                f.close()
+            except:
+                raise
+            finally:
+                del self.files[fh]
 
 
 class OneDriveFS(LoggingMixIn, Operations):
-    def __init__(self, api, root, cache, log=None, block_size=512):
-        self.api, self.root, self.block_size, self.handles, self.cache = api, root, block_size, {}, cache
+    def __init__(self, api, root, cache, conf, log=None):
+        self.api, self.root, self.cache = api, root, cache
+        self.block_size = conf.getint('fuse', 'block_size')
 
         self.log = log or logging.getLogger(
             '{}.{}'.format(__name__, self.__class__.__name__))
 
+        self.handles = {}
+        """map fh->item\n\n :type: dict"""
+        self.fh = 1
+        """file handle counter\n\n :type: int"""
+        self.fh_lock = Lock()
+        """lock for fh counter increment and handle dict writes"""
+        self.rp = ReadProxy(self.api, conf.getint('read', 'open_chunk_limit'), conf.getint('read', 'timeout'), conf.getint('read', 'dl_chunk_size'))
+        """collection of files opened for reading"""
     # Helpers
     # =======
 
@@ -150,35 +426,58 @@ class OneDriveFS(LoggingMixIn, Operations):
     # File methods
     # ============
 
-    # def open(self, path, flags):
-    #     full_path = self._full_path(path)
-    #     return os.open(full_path, flags)
+    def open(self, path, flags):
+        if (flags & os.O_APPEND) == os.O_APPEND:
+            raise FuseOSError(errno.EFAULT)
+
+        item = self._getitem(path)
+        if not item:
+            raise FuseOSError(errno.ENOENT)
+        with self.fh_lock:
+            self.fh += 1
+            self.handles[self.fh] = item
+        return self.fh
 
     # def create(self, path, mode, fi=None):
     #     full_path = self._full_path(path)
     #     return os.open(full_path, os.O_WRONLY | os.O_CREAT, mode)
 
-    # def read(self, path, length, offset, fh):
-    #     os.lseek(fh, offset, os.SEEK_SET)
-    #     return os.read(fh, length)
+    def read(self, path, length, offset, fh):
+        """Read ```length`` bytes from ``path`` at ``offset``."""
+        if fh:
+            item = self.handles[fh]
+        else:
+            item = self._getitem(path)
+        if not item:
+            raise FuseOSError(errno.ENOENT)
+
+        if item.size <= offset:
+            return b''
+
+        if item.size < offset + length:
+            length = item.size - offset
+
+        self.log.debug('Reading file %s', path)
+        return self.rp.get(path, offset, length, item.size)
 
     # def write(self, path, buf, offset, fh):
     #     os.lseek(fh, offset, os.SEEK_SET)
     #     return os.write(fh, buf)
 
-    # def truncate(self, path, length, fh=None):
-    #     full_path = self._full_path(path)
-    #     with open(full_path, 'r+') as f:
-    #         f.truncate(length)
-
     # def flush(self, path, fh):
     #     return os.fsync(fh)
 
-    # def release(self, path, fh):
-    #     return os.close(fh)
-
-    # def fsync(self, path, fdatasync, fh):
-    #     return self.flush(path, fh)
+    def release(self, path, fh):
+        if fh:
+            item = self.handles[fh]
+        else:
+            item = self._getitem(path)
+        if item:
+            self.rp.release(path)
+            with self.fh_lock:
+                del self.handles[fh]
+        else:
+            raise FuseOSError(errno.ENOENT)
 
 def login_onedrive(client_id, client_secret, redirect_uri):
     scopes = ['wl.signin', 'wl.offline_access', 'onedrive.readwrite']
@@ -198,9 +497,9 @@ def authorize_onedrive(client, redirect_uri):
     auth_url = client.auth_provider.get_auth_url(redirect_uri)
 
     # Ask for the code
-    print 'Paste this URL into your browser, approve the app\'s access.'
-    print 'Copy everything in the address bar after "code=", and paste it below.'
-    print auth_url
+    print ('Paste this URL into your browser, approve the app\'s access.')
+    print ('Copy everything in the address bar after "code=", and paste it below.')
+    print (auth_url)
     code = raw_input('Paste code here: ')
     return code
 
@@ -242,30 +541,6 @@ def args():
 
     return optz
 
-def set_encoding(force_utf=False, logger=None):
-    """Sets the default encoding to UTF-8 if none is set.
-    :param force_utf: force UTF-8 output"""
-
-    enc = str.lower(sys.stdout.encoding)
-    print enc
-    utf_flag = False
-
-    if not enc or force_utf:
-        import io
-
-        sys.stdout = io.TextIOWrapper(sys.stdout.detach(), encoding='utf-8')
-        sys.stderr = io.TextIOWrapper(sys.stderr.detach(), encoding='utf-8')
-        utf_flag = True
-    else:
-        def unicode_hook(type_, value, traceback):
-            sys.__excepthook__(type_, value, traceback)
-            if type_ == UnicodeEncodeError:
-                logger.error('Please set your locale or use the "--utf" flag.')
-
-        sys.excepthook = unicode_hook
-
-    return utf_flag
-
 def main():
     optz = args()
 
@@ -294,8 +569,7 @@ def main():
     sync_process = Process(target=sync_onedrive_items, args=(items_cache, api, log, int(cfg['onedrive']['sync_time'])))
     sync_process.start()
 
-    FUSE(OneDriveFS(api, root='/', log=log, cache=items_cache,
-        block_size=int(cfg['fuse']['block_size'])), optz.mountpoint, foreground=True)
+    FUSE(OneDriveFS(api, root='/', log=log, cache=items_cache, conf=cfg), optz.mountpoint, foreground=True)
 
 if __name__ == '__main__':
     main()
