@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-
 from __future__ import with_statement
 from calendar import timegm
 from time import time, sleep
@@ -10,12 +8,12 @@ import errno
 import logging
 import onedrivesdk
 from multiprocessing import Process
-from threading import Lock
+from threading import Lock, Event, Thread
 from collections import defaultdict, deque
-import sys
 import os
 import http.client as http
 import requests
+from queue import Queue, Full as QueueFull
 
 
 from utils.conf import get_conf
@@ -156,8 +154,8 @@ class ReadProxy(object):
 class WriteProxy(object):
     """Collection of WriteStreams for consecutive file write operations."""
 
-    def __init__(self, acd_client, cache, buffer_size, timeout):
-        self.acd_client = acd_client
+    def __init__(self, api, cache, buffer_size, timeout):
+        self.api = api
         self.cache = cache
         self.files = defaultdict(lambda: WriteProxy.WriteStream(buffer_size, timeout))
 
@@ -238,21 +236,21 @@ class WriteProxy(object):
                 if self.done.wait(1):
                     return
 
-    def write_n_sync(self, stream: WriteStream, node_id: str):
-        """Try to overwrite file with id ``node_id`` with content from ``stream``.
+    def write_n_sync(self, stream: WriteStream, path: str):
+        """Try to overwrite file with id ``path`` with content from ``stream``.
         Triggers the :attr:`WriteStream.done` event on success.
         :param stream: a file-like object"""
 
         try:
-            r = self.acd_client.overwrite_stream(stream, node_id)
+            r = self.api.overwrite_stream(stream, path)
         except (RequestError, IOError) as e:
             stream.error = True
-            logger.error('Error writing node "%s". %s' % (node_id, str(e)))
+            logger.error('Error writing node "%s". %s' % (path, str(e)))
         else:
             self.cache.insert_node(r)
             stream.done.set()
 
-    def write(self, node_id, fh, offset, bytes_):
+    def write(self, path, fh, offset, bytes_):
         """Gets WriteStream from defaultdict. Creates overwrite thread if offset is 0,
         tries to continue otherwise.
         :raises: FuseOSError: wrong offset or writing failed"""
@@ -267,7 +265,7 @@ class WriteProxy(object):
             raise FuseOSError(errno.ESPIPE)
 
         if offset == 0:
-            t = Thread(target=self.write_n_sync, args=(f, node_id))
+            t = Thread(target=self.write_n_sync, args=(f, path))
             t.daemon = True
             t.start()
 
